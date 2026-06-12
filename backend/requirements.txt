@@ -1,0 +1,7 @@
+Django==5.2.8
+djangorestframework==3.16.1
+django-cors-headers==4.9.0
+pytest==9.0.1
+pytest-django==4.11.1
+PyMuPDF==1.26.6
+Pillow==12.0.0

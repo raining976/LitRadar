@@ -1,0 +1,13 @@
+{
+  "name": "litradar",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "frontend:test": "npm --prefix frontend test",
+    "backend:dev": "bash scripts/dev-backend.sh",
+    "backend:test": "cd backend && .venv/bin/pytest",
+    "tauri:dev": "npm --prefix frontend run tauri -- dev"
+  }
+}

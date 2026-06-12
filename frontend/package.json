@@ -1,0 +1,23 @@
+{
+  "name": "litradar-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vue-tsc --noEmit && vite build",
+    "test": "vitest",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "vite": "latest",
+    "vue": "latest"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "latest",
+    "typescript": "latest",
+    "vitest": "latest",
+    "vue-tsc": "latest"
+  }
+}
