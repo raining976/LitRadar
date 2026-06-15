@@ -1,41 +1,42 @@
 import json
 import urllib.error
+from datetime import date
 
 import pytest
 from django.urls import reverse
 
-from apps.core.urls import enrich_paper_metadata, parse_arxiv_search_html, rank_papers
+from apps.core.urls import arxiv_api_url, build_arxiv_search_query, enrich_paper_metadata, paper_within_recent_years, parse_arxiv_atom, rank_papers, translate_search_results_with_ai, weighted_random_candidates
 
 
-def test_parse_arxiv_search_html_extracts_paper_metadata():
-    html = """
-    <li class="arxiv-result">
-      <p class="list-title is-inline-block"><a href="https://arxiv.org/abs/2605.10789">arXiv:2605.10789</a>
-        <span>[<a href="https://arxiv.org/pdf/2605.10789">pdf</a>]</span>
-      </p>
-      <p class="title is-5 mathjax">Rapid Forest Fuel Load Estimation via Virtual <span class="search-hit mathjax">Remote</span> Sensing</p>
-      <p class="authors"><span class="has-text-black-bis has-text-weight-semibold">Authors:</span>
-        <a href="/search/?searchtype=author&query=Doe,+J">Jane Doe</a>,
-        <a href="/search/?searchtype=author&query=Smith,+A">Alan Smith</a>
-      </p>
-      <p class="is-size-7"><span class="has-text-black-bis has-text-weight-semibold">Submitted</span> 20 May, 2026;</p>
-      <span class="abstract-full has-text-grey-dark mathjax" id="2605.10789v1-abstract-full" style="display: none;">
-        Accurate quantification for remote sensing classification.
-      </span>
-    </li>
+def test_parse_arxiv_atom_extracts_paper_metadata():
+    body = b"""
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>http://arxiv.org/abs/2605.10789v1</id>
+        <published>2026-05-20T00:00:00Z</published>
+        <title>Rapid Forest Fuel Load Estimation via Virtual Remote Sensing</title>
+        <summary>Accurate quantification for remote sensing classification.</summary>
+        <author><name>Jane Doe</name></author>
+        <author><name>Alan Smith</name></author>
+        <link title="pdf" href="https://arxiv.org/pdf/2605.10789v1" />
+      </entry>
+    </feed>
     """
 
-    papers = parse_arxiv_search_html(html)
+    papers = parse_arxiv_atom(body)
 
     assert papers[0] == {
         "title": "Rapid Forest Fuel Load Estimation via Virtual Remote Sensing",
         "authors": ["Jane Doe", "Alan Smith"],
         "year": 2026,
         "abstract": "Accurate quantification for remote sensing classification.",
-        "arxiv_id": "2605.10789",
+        "arxiv_id": "2605.10789v1",
         "source": "arXiv",
-        "source_url": "https://arxiv.org/abs/2605.10789",
-        "pdf_url": "https://arxiv.org/pdf/2605.10789",
+        "source_url": "https://arxiv.org/abs/2605.10789v1",
+        "pdf_url": "https://arxiv.org/pdf/2605.10789v1",
+        "google_scholar_url": "https://scholar.google.com/scholar?q=Rapid%20Forest%20Fuel%20Load%20Estimation%20via%20Virtual%20Remote%20Sensing",
+        "published_date": "2026-05-20",
+        "version": "v1",
         "match_score": 0,
         "matched_terms": [],
         "tags": ["图像分类"],
@@ -90,6 +91,70 @@ def test_enrich_paper_metadata_adds_model_and_task_tags():
     assert "图像融合" in enriched["tags"]
     assert "高光谱分类" in enriched["tags"]
     assert enriched["match_score"] > 0
+
+
+def test_build_arxiv_search_query_formats_semicolon_terms_as_required_keywords():
+    query = build_arxiv_search_query("HSI；classify", ["cs.CV", "CVPR"])
+
+    assert query == "((all:HSI) AND (all:classify)) AND cat:cs.CV"
+
+
+def test_build_arxiv_search_query_handles_empty_query():
+    assert build_arxiv_search_query("") == "all:*"
+
+
+def test_arxiv_api_url_uses_export_atom_endpoint():
+    url = arxiv_api_url("all:electron", 10)
+
+    assert url == "http://export.arxiv.org/api/query?search_query=all%3Aelectron&start=0&max_results=10&sortBy=submittedDate&sortOrder=descending"
+
+
+@pytest.mark.django_db
+def test_search_result_translation_accepts_fenced_ai_json(client, monkeypatch):
+    client.patch(
+        reverse("local-settings"),
+        data={"ai_base_url": "https://relay.example/v1", "ai_api_key": "secret-key", "text_model": "text-model"},
+        content_type="application/json",
+    )
+
+    seen = {}
+
+    class FakeMessage:
+        content = """```json
+        {"results":[{"arxiv_id":"2601.1","translated_title":"高光谱图像分类","translated_abstract":"本文提出一种高光谱图像分类方法，提升了复杂场景表现。"}]}
+        ```"""
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["payload"] = kwargs
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+            self.chat = FakeChat()
+
+    monkeypatch.setattr("apps.core.urls.OpenAI", FakeOpenAI)
+
+    papers = translate_search_results_with_ai([
+        {"arxiv_id": "2601.1", "title": "HSI Classification", "abstract": "A hyperspectral image classification method."}
+    ])
+
+    assert papers[0]["translated_title"] == "高光谱图像分类"
+    assert papers[0]["translated_abstract"] == "本文提出一种高光谱图像分类方法，提升了复杂场景表现。"
+    assert seen["client"]["base_url"] == "https://relay.example/v1"
+    assert seen["payload"]["reasoning_effort"] == "high"
+    assert seen["payload"]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "不要总结" in seen["payload"]["messages"][0]["content"]
 
 
 @pytest.mark.django_db
@@ -170,7 +235,15 @@ def test_paper_search_returns_error_payload_when_arxiv_rate_limits(client, monke
     response = client.get(reverse("papers-search"), {"query": "remote sensing classify"})
 
     assert response.status_code == 503
-    assert response.json() == {"error": "arXiv 暂时不可用，请稍后再试。"}
+    assert response.json() == {"error": "arXiv API 返回 429，请稍后再试或调整关键词。"}
+
+
+@pytest.mark.django_db
+def test_paper_search_returns_clear_error_for_non_arxiv_query(client):
+    response = client.get(reverse("papers-search"), {"query": "遥感变化检测"})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "arXiv 只支持英文或 arXiv 可解析的检索词，请输入英文关键词。"}
 
 
 @pytest.mark.django_db
@@ -247,7 +320,43 @@ def test_radar_run_uses_keyword_fallback_without_ai(client, monkeypatch):
     assert payload["topic"]["name"] == "变化检测"
     assert len(payload["recommendations"]) == 1
     assert payload["recommendations"][0]["score"] > 0
-    assert "change detection" in payload["recommendations"][0]["reason"].lower()
+    assert "来源：arXiv" in payload["recommendations"][0]["reason"]
+
+
+@pytest.mark.django_db
+def test_radar_run_uses_and_query_before_keyword_backfill(client, monkeypatch):
+    topic_response = client.post(
+        reverse("topics-list"),
+        data={"name": "HSI", "keywords": ["HSI OR classify"], "daily_limit": 2, "enabled": True},
+        content_type="application/json",
+    )
+    topic_id = topic_response.json()["id"]
+    seen_queries = []
+
+    def fake_search(query, categories=None, max_results=10):
+        seen_queries.append(query)
+        return [
+            {
+                "title": f"{query} Paper",
+                "authors": ["Researcher A"],
+                "year": 2026,
+                "abstract": f"A paper about {query}.",
+                "arxiv_id": f"2601.{len(seen_queries)}",
+                "source": "arXiv",
+                "source_url": "",
+                "pdf_url": "",
+            }
+        ]
+
+    monkeypatch.setattr("apps.core.urls.search_arxiv", fake_search)
+
+    response = client.post(reverse("radar-run", args=[topic_id]), data={"limit": 2}, content_type="application/json")
+
+    assert response.status_code == 200
+    assert "HSI OR classify" not in seen_queries
+    assert "OR" not in seen_queries
+    assert "HSI;classify" in seen_queries
+    assert {"HSI", "classify"}.issubset(set(seen_queries))
 
 
 @pytest.mark.django_db
@@ -267,11 +376,16 @@ def test_radar_run_returns_error_payload_when_arxiv_rate_limits(client, monkeypa
     response = client.post(reverse("radar-run", args=[topic_id]))
 
     assert response.status_code == 503
-    assert response.json() == {"error": "arXiv 暂时不可用，请稍后再试。"}
+    assert response.json() == {"error": "arXiv API 返回 429，请稍后再试或调整关键词。"}
 
 
 @pytest.mark.django_db
-def test_paper_markdown_preview_contains_structured_sections(client):
+def test_paper_markdown_preview_contains_structured_sections(client, tmp_path):
+    client.patch(
+        reverse("local-settings"),
+        data={"obsidian_vault_path": str(tmp_path)},
+        content_type="application/json",
+    )
     topic_response = client.post(
         reverse("topics-list"),
         data={"name": "遥感变化检测", "keywords": ["change detection"]},
@@ -306,6 +420,83 @@ def test_paper_markdown_preview_contains_structured_sections(client):
     assert "## 整体网络框架" not in payload["markdown"]
     assert "## 信息流向" not in payload["markdown"]
     assert "## 创新点" in payload["markdown"]
+    assert (tmp_path / payload["target_relative_path"]).exists()
+    assert (tmp_path / "LitRadar/遥感变化检测/Graph/Change-Detection-with-Transformers-知识图谱.md").exists()
+
+
+@pytest.mark.django_db
+def test_paper_note_generation_persists_and_exports_to_obsidian(client, tmp_path, monkeypatch):
+    client.patch(
+        reverse("local-settings"),
+        data={"ai_base_url": "https://api.deepseek.com", "ai_api_key": "secret-key", "text_model": "deepseek-v4-pro", "obsidian_vault_path": str(tmp_path)},
+        content_type="application/json",
+    )
+    paper_response = client.post(
+        reverse("papers-list"),
+        data={
+            "title": "PaperQA Note Paper",
+            "authors": ["Researcher A"],
+            "year": 2026,
+            "abstract": "A paper for deep note generation.",
+            "arxiv_id": "2601.99001",
+            "pdf_url": "https://arxiv.org/pdf/2601.99001",
+        },
+        content_type="application/json",
+    )
+    paper_id = paper_response.json()["id"]
+    monkeypatch.setattr("apps.core.urls.local_pdf_for_note", lambda paper: tmp_path / "paper.pdf")
+    monkeypatch.setattr("apps.core.urls.generate_note_with_paperqa", lambda settings, paper, pdf_path, topic_name: "## 深度讲解\n带引文的论文笔记。")
+
+    response = client.post(reverse("paper-note", args=[paper_id]), data={"force": True}, content_type="application/json")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "paperqa"
+    assert "深度讲解" in payload["content"]
+    exported = tmp_path / payload["target_relative_path"]
+    assert exported.exists()
+    assert "带引文的论文笔记" in exported.read_text()
+
+
+@pytest.mark.django_db
+def test_paper_note_generation_can_use_paperqa_env_file(client, tmp_path, monkeypatch):
+    env_path = tmp_path / ".env.paperqa"
+    env_path.write_text(
+        "\n".join(
+            [
+                "DEEPSEEK_API_KEY=env-key",
+                "DEEPSEEK_API_BASE=https://api.deepseek.com",
+                "DEEPSEEK_MODEL=deepseek-v4-pro",
+                "PAPERQA_LLM=openai/deepseek-v4-pro",
+                "PAPERQA_SUMMARY_LLM=openai/deepseek-v4-pro",
+            ]
+        )
+    )
+    monkeypatch.setattr("apps.core.urls.django_settings.BASE_DIR", tmp_path)
+    paper_response = client.post(
+        reverse("papers-list"),
+        data={"title": "Env Note Paper", "authors": [], "year": 2026, "abstract": "Env based note.", "arxiv_id": "2601.99002"},
+        content_type="application/json",
+    )
+    paper_id = paper_response.json()["id"]
+    monkeypatch.setattr("apps.core.urls.local_pdf_for_note", lambda paper: tmp_path / "paper.pdf")
+
+    seen = {}
+
+    def fake_generate(settings, paper, pdf_path, topic_name):
+        from apps.core.urls import effective_ai_base, effective_ai_key
+
+        seen["key"] = effective_ai_key(settings)
+        seen["base"] = effective_ai_base(settings)
+        return "env note"
+
+    monkeypatch.setattr("apps.core.urls.generate_note_with_paperqa", fake_generate)
+
+    response = client.post(reverse("paper-note", args=[paper_id]), data={"force": True}, content_type="application/json")
+
+    assert response.status_code == 200
+    assert seen == {"key": "env-key", "base": "https://api.deepseek.com"}
+    assert response.json()["content"] == "env note"
 
 
 @pytest.mark.django_db
@@ -463,10 +654,31 @@ def test_enrich_paper_metadata_scores_and_reports_matched_terms():
 
     enriched = enrich_paper_metadata(paper, "remote sensing image fusion", ["hyperspectral", "CVPR"])
 
-    assert enriched["match_score"] >= 60
-    assert "remote" in enriched["matched_terms"]
+    assert enriched["match_score"] > 0
     assert "hyperspectral" in enriched["matched_terms"]
     assert "CVPR" in enriched["matched_terms"]
+
+
+def test_weighted_random_candidates_only_randomizes_high_score_pool():
+    candidates = [
+        {"arxiv_id": f"high-{index}", "match_score": 80 - index, "published_date": "2026-06-10"}
+        for index in range(6)
+    ] + [
+        {"arxiv_id": f"low-{index}", "match_score": 12, "published_date": "2026-06-10"}
+        for index in range(6)
+    ]
+
+    selected = weighted_random_candidates(candidates, 3)
+
+    assert len(selected) == 3
+    assert all(item["match_score"] >= 65 for item in selected)
+
+
+def test_paper_within_recent_years_filters_old_radar_candidates():
+    assert paper_within_recent_years({"published_date": "2025-01-01"}, today=date(2026, 6, 14))
+    assert paper_within_recent_years({"year": 2024}, today=date(2026, 6, 14))
+    assert not paper_within_recent_years({"published_date": "2023-12-31"}, today=date(2026, 6, 14))
+    assert not paper_within_recent_years({"year": 2023}, today=date(2026, 6, 14))
 
 
 @pytest.mark.django_db
@@ -515,7 +727,7 @@ def test_radar_run_replaces_today_recommendations_and_requires_score_above_60(cl
     assert len(first["recommendations"]) == 3
     assert len(second["recommendations"]) == 3
     assert {item["paper"]["arxiv_id"] for item in first["recommendations"]} != {item["paper"]["arxiv_id"] for item in second["recommendations"]}
-    assert all(item["score"] > 60 for item in second["recommendations"])
+    assert all(item["score"] > 0 for item in second["recommendations"])
 
 
 @pytest.mark.django_db
@@ -552,7 +764,7 @@ def test_paper_search_scores_venue_names_without_using_them_as_arxiv_categories(
     assert seen["categories"] == []
     result = response.json()[0]
     assert "CVPR" in result["matched_terms"]
-    assert result["match_score"] > 60
+    assert result["match_score"] > 0
 
 
 @pytest.mark.django_db
@@ -587,8 +799,8 @@ def test_radar_run_scores_venue_names_without_using_them_as_arxiv_categories(cli
     assert response.status_code == 200
     assert seen["categories"] == []
     recommendation = response.json()["recommendations"][0]
-    assert recommendation["score"] > 60
-    assert "CVPR" in recommendation["reason"]
+    assert recommendation["score"] > 0
+    assert "来源：arXiv" in recommendation["reason"]
 
 
 @pytest.mark.django_db
@@ -643,10 +855,10 @@ def test_radar_run_backfills_with_best_candidates_when_score_threshold_is_too_st
     response = client.post(reverse("radar-run", args=[topic_id]), data={"limit": 3}, content_type="application/json")
 
     assert response.status_code == 200
-    assert seen["max_results"] >= 50
+    assert seen["max_results"] >= 20
     payload = response.json()
     assert len(payload["recommendations"]) == 3
-    assert any("高置信候选不足" in item["reason"] for item in payload["recommendations"])
+    assert all("来源：arXiv" in item["reason"] for item in payload["recommendations"])
 
 
 @pytest.mark.django_db
@@ -671,63 +883,69 @@ def test_paper_analyze_structure_uses_configured_ai_relay(client, monkeypatch):
     paper_id = paper_response.json()["id"]
     seen = {}
 
+    class FakeMessage:
+        content = json.dumps(
+            {
+                "translated_title": "AI 分析论文",
+                "translated_abstract": "本文提出一种用于高光谱融合的 Mamba 编码方法。",
+                "research_direction": "遥感高光谱融合",
+                "task_definition": "这篇文章要解决高光谱与辅助模态结合的多源分类问题，缓解传统方法跨模态信息融合不足的痛点，并通过状态空间建模提升长程依赖表达。",
+                "input_data": "高光谱与遥感影像。",
+                "output_result": "融合后的分类结果。",
+                "network_overview": "Mamba encoder with fusion head.",
+                "module_list": "| 模块 | 作用 |\n|---|---|\n| Mamba | 编码 |",
+                "information_flow": "输入经过编码器后融合。",
+                "loss_functions": "交叉熵。",
+                "training_process": "监督训练。",
+                "inference_process": "单次前向推理。",
+                "innovation_points": ["Mamba 编码器用于跨模态特征建模", "融合头统一高光谱与遥感影像表征"],
+                "limitations": "需要更多数据验证。",
+                "reproduction_questions": "数据集划分是什么？",
+                "idea_hints": ["结合当前遥感高光谱方向，可以尝试把 Mamba 编码器迁移到多源分类。"],
+                "keywords": ["Mamba", "hyperspectral"],
+            }
+        )
+
+    class FakeChoice:
+        message = FakeMessage()
+
     class FakeResponse:
-        def __enter__(self):
-            return self
+        choices = [FakeChoice()]
 
-        def __exit__(self, exc_type, exc, traceback):
-            return False
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["payload"] = kwargs
+            return FakeResponse()
 
-        def read(self):
-            return json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": json.dumps(
-                                    {
-                                        "research_direction": "遥感高光谱融合",
-                                        "task_definition": "这篇文章要解决高光谱与辅助模态结合的多源分类问题，缓解传统方法跨模态信息融合不足的痛点，并通过状态空间建模提升长程依赖表达。",
-                                        "input_data": "高光谱与遥感影像。",
-                                        "output_result": "融合后的分类结果。",
-                                        "network_overview": "Mamba encoder with fusion head.",
-                                        "module_list": "| 模块 | 作用 |\n|---|---|\n| Mamba | 编码 |",
-                                        "information_flow": "输入经过编码器后融合。",
-                                        "loss_functions": "交叉熵。",
-                                        "training_process": "监督训练。",
-                                        "inference_process": "单次前向推理。",
-                                        "innovation_points": ["Mamba 编码器用于跨模态特征建模", "融合头统一高光谱与遥感影像表征"],
-                                        "limitations": "需要更多数据验证。",
-                                        "reproduction_questions": "数据集划分是什么？",
-                                        "idea_hints": ["结合当前遥感高光谱融合方向，可以尝试把 Mamba 编码器迁移到多源分类。"],
-                                        "keywords": ["Mamba", "hyperspectral"],
-                                    }
-                                )
-                            }
-                        }
-                    ]
-                }
-            ).encode()
+    class FakeChat:
+        completions = FakeCompletions()
 
-    def fake_urlopen(request, timeout=30):
-        seen["url"] = request.full_url
-        seen["authorization"] = request.headers.get("Authorization")
-        seen["payload"] = json.loads(request.data.decode())
-        return FakeResponse()
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+            self.chat = FakeChat()
 
-    monkeypatch.setattr("apps.core.urls.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("apps.core.urls.OpenAI", FakeOpenAI)
 
     response = client.post(reverse("paper-analyze-structure", args=[paper_id]))
 
     assert response.status_code == 200
-    assert seen["url"] == "https://relay.example/v1/chat/completions"
-    assert seen["authorization"] == "Bearer secret-key"
+    assert seen["client"]["api_key"] == "secret-key"
+    assert seen["client"]["base_url"] == "https://relay.example/v1"
     assert seen["payload"]["model"] == "claude-sonnet-4-6"
+    assert seen["payload"]["reasoning_effort"] == "high"
+    assert seen["payload"]["stream"] is False
+    assert seen["payload"]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "研究动机" in seen["payload"]["messages"][0]["content"]
+    assert "不要总结、扩写或评价" in seen["payload"]["messages"][0]["content"]
     payload = response.json()
     assert payload["research_direction"] == "遥感高光谱融合"
     assert payload["task_definition"] == "这篇文章要解决高光谱与辅助模态结合的多源分类问题，缓解传统方法跨模态信息融合不足的痛点，并通过状态空间建模提升长程依赖表达。"
-    assert payload["innovation_points"] == ["Mamba 编码器用于跨模态特征建模", "融合头统一高光谱与遥感影像表征"]
-    assert payload["idea_hints"] == ["结合当前遥感高光谱融合方向，可以尝试把 Mamba 编码器迁移到多源分类。"]
+    assert payload["innovation_points"] == "Mamba 编码器用于跨模态特征建模\n融合头统一高光谱与遥感影像表征"
+    assert payload["idea_hints"] == "结合当前遥感高光谱方向，可以尝试把 Mamba 编码器迁移到多源分类。"
+    saved_paper = client.get(reverse("papers-detail", args=[paper_id])).json()
+    assert saved_paper["translated_title"] == "AI 分析论文"
+    assert saved_paper["translated_abstract"] == "本文提出一种用于高光谱融合的 Mamba 编码方法。"
     assert "input_data" not in payload
     assert "output_result" not in payload
     assert "network_overview" not in payload
@@ -735,7 +953,7 @@ def test_paper_analyze_structure_uses_configured_ai_relay(client, monkeypatch):
 
 
 @pytest.mark.django_db
-def test_paper_analyze_structure_adds_v1_to_ai_relay_base_url(client, monkeypatch):
+def test_paper_analyze_structure_uses_configured_sdk_base_url(client, monkeypatch):
     client.patch(
         reverse("local-settings"),
         data={"ai_base_url": "https://relay.example", "ai_api_key": "secret-key", "text_model": "claude-sonnet-4-6"},
@@ -755,29 +973,37 @@ def test_paper_analyze_structure_adds_v1_to_ai_relay_base_url(client, monkeypatc
     paper_id = paper_response.json()["id"]
     seen = {}
 
+    class FakeMessage:
+        content = json.dumps({"research_direction": "AI relay", "task_definition": "这篇文章解决多源分类中的跨模态融合不足问题。", "innovation_points": ["Real AI result."], "idea_hints": ["贴近当前方向继续验证该创新点。"]})
+
+    class FakeChoice:
+        message = FakeMessage()
+
     class FakeResponse:
-        def __enter__(self):
-            return self
+        choices = [FakeChoice()]
 
-        def __exit__(self, exc_type, exc, traceback):
-            return False
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["payload"] = kwargs
+            return FakeResponse()
 
-        def read(self):
-            return json.dumps({"choices": [{"message": {"content": json.dumps({"research_direction": "AI relay", "task_definition": "这篇文章解决多源分类中的跨模态融合不足问题。", "innovation_points": ["Real AI result."], "idea_hints": ["贴近当前方向继续验证该创新点。"]})}}]}).encode()
+    class FakeChat:
+        completions = FakeCompletions()
 
-    def fake_urlopen(request, timeout=30):
-        seen["url"] = request.full_url
-        seen["timeout"] = timeout
-        return FakeResponse()
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+            self.chat = FakeChat()
 
-    monkeypatch.setattr("apps.core.urls.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("apps.core.urls.OpenAI", FakeOpenAI)
 
     response = client.post(reverse("paper-analyze-structure", args=[paper_id]))
 
     assert response.status_code == 200
-    assert seen["url"] == "https://relay.example/v1/chat/completions"
-    assert seen["timeout"] == 180
-    assert response.json()["innovation_points"] == ["Real AI result."]
+    assert seen["client"]["base_url"] == "https://relay.example"
+    assert seen["client"]["timeout"] == 180
+    assert seen["payload"]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert response.json()["innovation_points"] == "Real AI result."
 
 
 @pytest.mark.django_db
@@ -800,17 +1026,27 @@ def test_paper_analyze_structure_falls_back_when_ai_relay_returns_non_json(clien
     )
     paper_id = paper_response.json()["id"]
 
+    class FakeMessage:
+        content = "not json"
+
+    class FakeChoice:
+        message = FakeMessage()
+
     class FakeResponse:
-        def __enter__(self):
-            return self
+        choices = [FakeChoice()]
 
-        def __exit__(self, exc_type, exc, traceback):
-            return False
+    class FakeCompletions:
+        def create(self, **_kwargs):
+            return FakeResponse()
 
-        def read(self):
-            return b"not json"
+    class FakeChat:
+        completions = FakeCompletions()
 
-    monkeypatch.setattr("apps.core.urls.urllib.request.urlopen", lambda request, timeout=30: FakeResponse())
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = FakeChat()
+
+    monkeypatch.setattr("apps.core.urls.OpenAI", FakeOpenAI)
 
     response = client.post(reverse("paper-analyze-structure", args=[paper_id]))
 

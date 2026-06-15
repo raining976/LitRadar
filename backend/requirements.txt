@@ -5,3 +5,5 @@ pytest==9.0.1
 pytest-django==4.11.1
 PyMuPDF==1.26.6
 Pillow==12.0.0
+openai==2.41.1
+paper-qa==2026.3.18

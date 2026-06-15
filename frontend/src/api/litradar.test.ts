@@ -6,9 +6,11 @@ import {
   createPaper,
   createTopic,
   fetchLocalSettings,
+  fetchOpenAlexDiscovery,
   fetchPapers,
-  fetchPaperMarkdown,
+  fetchPaperNote,
   fetchTopics,
+  generatePaperNote,
   runRadar,
   saveLocalSettings,
   searchPapers,
@@ -81,9 +83,16 @@ describe('LitRadar API client', () => {
     await analyzePaperStructure(1, fetcher, 'http://127.0.0.1:8765');
     expect(fetcher).toHaveBeenLastCalledWith('http://127.0.0.1:8765/api/papers/1/analyze-structure/', { method: 'POST' });
 
-    fetcher.mockResolvedValueOnce(jsonResponse({ target_relative_path: 'Papers/a.md', markdown: '# A' }));
-    await fetchPaperMarkdown(1, fetcher, 'http://127.0.0.1:8765');
-    expect(fetcher).toHaveBeenLastCalledWith('http://127.0.0.1:8765/api/papers/1/obsidian-markdown/');
+    fetcher.mockResolvedValueOnce(jsonResponse({ content: '# Note', source: 'paperqa', target_relative_path: 'Notes/a.md', updated_at: '' }));
+    await fetchPaperNote(1, fetcher, 'http://127.0.0.1:8765');
+    expect(fetcher).toHaveBeenLastCalledWith('http://127.0.0.1:8765/api/papers/1/note/');
+
+    fetcher.mockResolvedValueOnce(jsonResponse({ content: '# Note', source: 'paperqa', target_relative_path: 'Notes/a.md', updated_at: '' }));
+    await generatePaperNote(1, true, fetcher, 'http://127.0.0.1:8765');
+    expect(fetcher).toHaveBeenLastCalledWith('http://127.0.0.1:8765/api/papers/1/note/', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ force: true }),
+    }));
 
     fetcher.mockResolvedValueOnce(jsonResponse([paper]));
     await fetchPapers(fetcher, 'http://127.0.0.1:8765');
@@ -106,5 +115,13 @@ describe('LitRadar API client', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ limit: 2 }),
     });
+  });
+
+  it('fetches OpenAlex discovery papers for a topic', async () => {
+    const papers = [{ title: 'Test Paper', authors: ['A'], year: 2026, abstract: '', arxiv_id: '', source: 'OpenAlex', source_url: '', pdf_url: '', topic: null }];
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(papers));
+
+    await expect(fetchOpenAlexDiscovery(1, fetcher, 'http://127.0.0.1:8765')).resolves.toEqual(papers);
+    expect(fetcher).toHaveBeenCalledWith('http://127.0.0.1:8765/api/papers/openalex/discover/?topic_id=1');
   });
 });

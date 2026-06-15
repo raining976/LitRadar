@@ -33,16 +33,28 @@ export interface PaperInsight {
   markdown_note?: string;
 }
 
+export interface PaperNote {
+  content: string;
+  source: string;
+  target_relative_path: string;
+  updated_at: string;
+}
+
 export interface Paper {
   id?: number;
   title: string;
+  translated_title?: string;
   authors: string[];
   year: number | null;
   abstract: string;
+  translated_abstract?: string;
   arxiv_id: string;
   source: string;
   source_url: string;
   pdf_url: string;
+  google_scholar_url?: string;
+  published_date?: string;
+  version?: string;
   local_pdf_path?: string;
   topic: number | null;
   status?: string;
@@ -51,6 +63,7 @@ export interface Paper {
   match_score?: number;
   figures?: unknown[];
   insight?: PaperInsight | null;
+  note?: PaperNote | null;
 }
 
 export interface Recommendation {
@@ -68,11 +81,6 @@ export interface RadarRunPayload {
   topic: ResearchTopic;
   date: string;
   recommendations: Recommendation[];
-}
-
-export interface MarkdownPreview {
-  target_relative_path: string;
-  markdown: string;
 }
 
 type Fetcher = typeof fetch;
@@ -136,6 +144,10 @@ export function searchPapers(query: string, topicId?: number | null, fetcher?: F
   return requestJson(`/api/papers/search/?${params.toString()}`, fetcher, baseUrl);
 }
 
+export function fetchOpenAlexDiscovery(topicId: number, fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {
+  return requestJson(`/api/papers/openalex/discover/?topic_id=${topicId}`, fetcher, baseUrl);
+}
+
 export function fetchPapers(fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {
   return requestJson('/api/papers/', fetcher, baseUrl);
 }
@@ -164,6 +176,10 @@ export function analyzePaperStructure(paperId: number, fetcher?: Fetcher, baseUr
   return requestJson(`/api/papers/${paperId}/analyze-structure/`, fetcher, baseUrl, { method: 'POST' });
 }
 
-export function fetchPaperMarkdown(paperId: number, fetcher?: Fetcher, baseUrl?: string): Promise<MarkdownPreview> {
-  return requestJson(`/api/papers/${paperId}/obsidian-markdown/`, fetcher, baseUrl);
+export function fetchPaperNote(paperId: number, fetcher?: Fetcher, baseUrl?: string): Promise<PaperNote> {
+  return requestJson(`/api/papers/${paperId}/note/`, fetcher, baseUrl);
+}
+
+export function generatePaperNote(paperId: number, force = false, fetcher?: Fetcher, baseUrl?: string): Promise<PaperNote> {
+  return requestJson(`/api/papers/${paperId}/note/`, fetcher, baseUrl, jsonInit('POST', { force }));
 }

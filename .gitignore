@@ -1,4 +1,4 @@
-node_modules/
+relonode_modules/
 dist/
 .venv/
 __pycache__/
@@ -6,4 +6,10 @@ __pycache__/
 .pytest_cache/
 db.sqlite3
 .env
+.env.paperqa
+.env.local
 target
+backend/.cache
+frontend/node_modules
+AGENTS.md
+CLAUDE.md

@@ -38,14 +38,18 @@ class Paper(models.Model):
     STATUS_EXPORTED = "exported"
 
     title = models.CharField(max_length=512)
+    translated_title = models.TextField(blank=True)
     authors = models.JSONField(default=list, blank=True)
     year = models.PositiveIntegerField(null=True, blank=True)
     abstract = models.TextField(blank=True)
+    translated_abstract = models.TextField(blank=True)
     arxiv_id = models.CharField(max_length=64, blank=True, unique=True)
     doi = models.CharField(max_length=128, blank=True)
     source = models.CharField(max_length=64, default="arXiv")
     source_url = models.URLField(blank=True)
     pdf_url = models.URLField(blank=True)
+    published_date = models.CharField(max_length=32, blank=True)
+    version = models.CharField(max_length=32, blank=True)
     local_pdf_path = models.CharField(max_length=1024, blank=True)
     parsed_text = models.TextField(blank=True)
     topic = models.ForeignKey(ResearchTopic, null=True, blank=True, on_delete=models.SET_NULL, related_name="papers")
@@ -75,6 +79,15 @@ class PaperInsight(models.Model):
     idea_hints = models.TextField(blank=True)
     keywords = models.JSONField(default=list, blank=True)
     markdown_note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class PaperNote(models.Model):
+    paper = models.OneToOneField(Paper, on_delete=models.CASCADE, related_name="note")
+    content = models.TextField(blank=True)
+    source = models.CharField(max_length=64, default="paperqa")
+    target_relative_path = models.CharField(max_length=1024, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
