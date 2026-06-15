@@ -85,7 +85,8 @@ export interface RadarRunPayload {
 
 type Fetcher = typeof fetch;
 
-const DEFAULT_BASE_URL = 'http://127.0.0.1:8765';
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+const DEFAULT_BASE_URL = isTauri ? 'http://127.0.0.1:18765' : 'http://127.0.0.1:8765';
 
 async function requestJson<T>(path: string, fetcher: Fetcher = fetch, baseUrl = DEFAULT_BASE_URL, init?: RequestInit): Promise<T> {
   const response = init === undefined ? await fetcher(`${baseUrl}${path}`) : await fetcher(`${baseUrl}${path}`, init);
@@ -146,6 +147,24 @@ export function searchPapers(query: string, topicId?: number | null, fetcher?: F
 
 export function fetchOpenAlexDiscovery(topicId: number, fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {
   return requestJson(`/api/papers/openalex/discover/?topic_id=${topicId}`, fetcher, baseUrl);
+}
+
+export interface AiTestResult {
+  ok: boolean;
+  model?: string;
+  error?: string;
+}
+
+export function translatePapersBatch(papers: Partial<Paper>[], fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {
+  return requestJson('/api/papers/translate-batch/', fetcher, baseUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ papers }),
+  });
+}
+
+export function testAiConnection(fetcher?: Fetcher, baseUrl?: string): Promise<AiTestResult> {
+  return requestJson('/api/settings/test-ai/', fetcher, baseUrl, { method: 'POST' });
 }
 
 export function fetchPapers(fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {

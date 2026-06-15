@@ -604,14 +604,16 @@ def parse_openalex_work(work, query="", keywords=None):
     return enriched
 
 
-def fetch_openalex_works(query, per_page=50):
-    """Fetch works from the OpenAlex semantic search API."""
-    cutoff_year = date.today().year - 2
+def fetch_openalex_works(query, per_page=15):
+    """Fetch works from the OpenAlex semantic search API, last 2 years only."""
+    today_str = date.today().isoformat()
+    cutoff = f"{date.today().year - 2}-01-01"
     params = urllib.parse.urlencode({
         "search": query,
         "per_page": str(per_page),
+        "filter": f"from_publication_date:{cutoff},to_publication_date:{today_str}",
     })
-    url = f"https://api.openalex.org/works?{params}&filter=from_publication_date:{cutoff_year}-01-01"
+    url = f"https://api.openalex.org/works?{params}"
     request = urllib.request.Request(url, headers={"User-Agent": "LitRadar/0.1 local literature tool"})
     context = ssl._create_unverified_context()
     with urllib.request.urlopen(request, timeout=15, context=context) as response:
@@ -638,7 +640,7 @@ def papers_search_view(request):
         log_arxiv_error(error, query, categories=[], max_results=10)
         return JsonResponse({"error": "arXiv 暂时不可用，请稍后再试。"}, status=503)
     ranked = rank_papers(results, query, topic_keywords)
-    return JsonResponse(translate_search_results_with_ai(ranked), safe=False)
+    return JsonResponse(ranked, safe=False)
 
 
 @csrf_exempt
@@ -1381,7 +1383,7 @@ def paper_note_view(request, paper_id):
     if request.method == "POST":
         settings = LocalSettings.current()
         if not has_effective_ai_config(settings):
-            return JsonResponse({"error": "请先在本地设置中配置 DeepSeek，或创建 backend/.env.paperqa。"}, status=400)
+            return JsonResponse({"error": "请先在本地设置中配置 AI 接口信息。"}, status=400)
         data = parse_json(request)
         note = generate_paper_note(settings, paper, force=bool(data.get("force")))
         return JsonResponse(note_payload(note))
@@ -1399,7 +1401,7 @@ def papers_openalex_discover_view(request):
         return JsonResponse({"error": "当前研究方向未配置关键词，请先在今日雷达中添加英文关键词。"}, status=400)
     query = " ".join(keywords)
     try:
-        works = fetch_openalex_works(query, per_page=50)
+        works = fetch_openalex_works(query, per_page=15)
     except urllib.error.HTTPError as error:
         logger.exception("OpenAlex API HTTP error: %s", error.code)
         return JsonResponse({"error": f"OpenAlex API 返回 {error.code}，请稍后再试。"}, status=503)
@@ -1413,33 +1415,89 @@ def papers_openalex_discover_view(request):
     for paper in papers:
         paper["_combined"] = paper.get("match_score", 0) * 3 + paper_recency_score(paper, today)
     papers.sort(key=lambda p: p["_combined"], reverse=True)
-    pool = papers[:20]
+    for paper in papers:
+        paper.pop("_combined", None)
+    pool = papers[:10]
     if len(pool) <= 6:
         selected = pool
     else:
         selected = random.sample(pool, 6)
-    for paper in selected:
-        paper.pop("_combined", None)
-        paper["arxiv_id"] = paper.get("openalex_id", "")
-    translated = translate_search_results_with_ai(selected)
-    for paper in translated:
-        paper["arxiv_id"] = ""
+    return JsonResponse(selected, safe=False)
+
+
+@csrf_exempt
+def test_ai_connection_view(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+    settings = LocalSettings.current()
+    if not has_effective_ai_config(settings):
+        return JsonResponse({"ok": False, "error": "AI 未配置：请先填写 Base URL、API Key 和模型名称。"})
+    try:
+        messages = [
+            {"role": "user", "content": "ping"},
+        ]
+        content = ai_message_content(ai_chat_completion(settings, messages, timeout=20))
+        if content:
+            return JsonResponse({"ok": True, "model": effective_text_model(settings)})
+        return JsonResponse({"ok": False, "error": "AI 返回了空内容，请检查模型名称和 API Key。"})
+    except Exception as error:
+        logger.exception("AI connection test failed: %s", type(error).__name__)
+        return JsonResponse({"ok": False, "error": f"AI 连接失败：{error}"})
+
+
+@csrf_exempt
+def paper_pdf_proxy_view(_request, paper_id):
+    """Proxy PDF content from source URL, caching locally."""
+    paper = get_object_or_404(Paper, pk=paper_id)
+    pdf_path = local_pdf_for_note(paper)
+    if not pdf_path:
+        return JsonResponse({"error": "无法获取 PDF，请确认 PDF 地址有效。"}, status=404)
+    try:
+        with open(pdf_path, "rb") as f:
+            content = f.read()
+    except OSError:
+        return JsonResponse({"error": "PDF 文件读取失败。"}, status=500)
+    from django.http import HttpResponse
+    response = HttpResponse(content, content_type="application/pdf")
+    response["Content-Disposition"] = "inline"
+    response["Content-Length"] = str(len(content))
+    return response
+
+
+@csrf_exempt
+def papers_translate_batch_view(request):
+    """Translate a batch of papers in the background. POST {papers: [{title, abstract, arxiv_id}, ...]}."""
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+    try:
+        data = json.loads(request.body)
+        papers = data.get("papers", [])
+    except (json.JSONDecodeError, TypeError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    if not papers:
+        return JsonResponse([], safe=False)
+    for paper in papers:
+        paper.setdefault("arxiv_id", paper.get("openalex_id", ""))
+    translated = translate_search_results_with_ai(papers)
     return JsonResponse(translated, safe=False)
 
 
 urlpatterns = [
     path("health/", health_view, name="health"),
     path("settings/", local_settings_view, name="local-settings"),
+    path("settings/test-ai/", test_ai_connection_view, name="test-ai-connection"),
     path("topics/", topics_list_view, name="topics-list"),
     path("topics/<int:topic_id>/", topics_detail_view, name="topics-detail"),
     path("papers/search/", papers_search_view, name="papers-search"),
     path("papers/openalex/discover/", papers_openalex_discover_view, name="papers-openalex-discover"),
+    path("papers/translate-batch/", papers_translate_batch_view, name="papers-translate-batch"),
     path("papers/", papers_list_view, name="papers-list"),
     path("papers/<int:paper_id>/", papers_detail_view, name="papers-detail"),
     path("papers/<int:paper_id>/pdf/", paper_pdf_view, name="paper-pdf"),
     path("papers/<int:paper_id>/parse/", paper_parse_view, name="paper-parse"),
     path("papers/<int:paper_id>/figures/<int:figure_id>/", paper_figure_detail_view, name="paper-figure-detail"),
     path("papers/<int:paper_id>/analyze-structure/", paper_analyze_structure_view, name="paper-analyze-structure"),
+    path("papers/<int:paper_id>/pdf-proxy/", paper_pdf_proxy_view, name="paper-pdf-proxy"),
     path("papers/<int:paper_id>/obsidian-markdown/", paper_obsidian_markdown_view, name="paper-obsidian-markdown"),
     path("papers/<int:paper_id>/note/", paper_note_view, name="paper-note"),
     path("radar/run/<int:topic_id>/", radar_run_view, name="radar-run"),

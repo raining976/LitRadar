@@ -13,3 +13,7 @@ backend/.cache
 frontend/node_modules
 AGENTS.md
 CLAUDE.md
+frontend/src-tauri/binaries
+frontend/src-tauri/capabilities
+frontend/src-tauri/gen
+frontend/src-tauri/.DS_Store

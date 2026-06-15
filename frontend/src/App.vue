@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { fetchHealth, type HealthPayload } from './api/health';
 import {
   analyzePaperStructure,
@@ -16,6 +17,9 @@ import {
   runRadar,
   saveLocalSettings,
   searchPapers,
+  testAiConnection,
+  translatePapersBatch,
+  type AiTestResult,
   updatePaper,
   updateTopic,
   type LocalSettingsPayload,
@@ -66,7 +70,7 @@ const selectedTopicId = ref<number | null>(null);
 const selectedPaperId = ref<number | null>(null);
 const editingPaperId = ref<number | null>(null);
 const readerMode = ref<ReaderMode>('summary');
-const radarLimit = ref(3);
+const radarLimit = ref(Number(localStorage.getItem('litradar_radar_limit')) || 3);
 const radarLimitEditing = ref(false);
 const radarLimitDraft = ref(3);
 const paperNote = ref<PaperNote | null>(null);
@@ -78,6 +82,9 @@ const settings = ref<LocalSettingsPayload>({
   vision_model: '',
   obsidian_vault_path: '',
 });
+const aiTestResult = ref<AiTestResult | null>(null);
+const testingAi = ref(false);
+const pendingPaperIds = ref<Set<number>>(new Set());
 
 const topicForm = ref({
   name: '遥感变化检测',
@@ -134,13 +141,22 @@ async function loadOpenAlexDiscovery(topicId: number, forceRefresh = false) {
     discoverResults.value = papers;
     discoverTopicId.value = topicId;
     saveDiscoverCache(topicId, papers);
-  } catch (caught) {
-    pushNotification(caught instanceof Error ? caught.message : 'OpenAlex 发现加载失败', 'warning');
-    const stale = loadDiscoverCache(topicId);
-    if (stale && stale.length > 0) {
-      discoverResults.value = stale;
-      discoverTopicId.value = topicId;
+    if (papers.length > 0 && hasApiKey.value) {
+      translatePapersBatch(papers).then(translated => {
+        if (translated.length === discoverResults.value.length) {
+          discoverResults.value = translated;
+          saveDiscoverCache(topicId, translated);
+        }
+      }).catch(() => {});
     }
+  } catch (caught) {
+    // 400 = no keywords configured, not an error worth notifying
+    const msg = caught instanceof Error ? caught.message : '';
+    if (!msg.includes('关键词')) {
+      pushNotification(msg || 'OpenAlex 发现加载失败', 'warning');
+    }
+    discoverResults.value = [];
+    discoverTopicId.value = topicId;
   } finally {
     discoverLoading.value = false;
   }
@@ -148,24 +164,41 @@ async function loadOpenAlexDiscovery(topicId: number, forceRefresh = false) {
 
 async function refreshOpenAlexDiscovery() {
   const topicId = discoverTopicId.value ?? activeTopic.value?.id ?? topics.value[0]?.id;
-  if (topicId != null) {
-    discoverLoading.value = true;
-    try {
-      const papers = await fetchOpenAlexDiscovery(topicId);
-      discoverResults.value = papers;
-      discoverTopicId.value = topicId;
-      saveDiscoverCache(topicId, papers);
-      pushNotification('OpenAlex 发现已刷新。', 'success');
-    } catch (caught) {
-      pushNotification(caught instanceof Error ? caught.message : 'OpenAlex 发现加载失败', 'warning');
-    } finally {
-      discoverLoading.value = false;
+  if (topicId == null) return;
+  discoverLoading.value = true;
+  try {
+    const papers = await fetchOpenAlexDiscovery(topicId);
+    discoverResults.value = papers;
+    discoverTopicId.value = topicId;
+    saveDiscoverCache(topicId, papers);
+    if (papers.length > 0 && hasApiKey.value) {
+      translatePapersBatch(papers).then(translated => {
+        if (translated.length === discoverResults.value.length) {
+          discoverResults.value = translated;
+          saveDiscoverCache(topicId, translated);
+        }
+      }).catch(() => {});
     }
+  } catch (caught) {
+    const msg = caught instanceof Error ? caught.message : '';
+    if (!msg.includes('关键词')) {
+      pushNotification(msg || 'OpenAlex 发现加载失败', 'warning');
+    }
+  } finally {
+    discoverLoading.value = false;
   }
 }
 
 const hasApiKey = computed(() => Boolean(settings.value.has_ai_api_key || settings.value.ai_api_key));
 const hasObsidian = computed(() => Boolean(settings.value.obsidian_vault_path));
+const pdfViewUrl = computed(() => {
+  const paper = selectedPaper.value;
+  if (!paper) return '';
+  if (isTauriEnv && paper.id) {
+    return `http://127.0.0.1:18765/api/papers/${paper.id}/pdf-proxy/`;
+  }
+  return paper.pdf_url || '';
+});
 const statusCards = computed(() => [
   { label: '本地后端', value: health.value ? '已连接' : '未连接', tone: health.value ? 'success' : 'error' },
   { label: '雷达方向', value: activeTopic.value?.name ?? '未配置', tone: activeTopic.value ? 'success' : 'warning' },
@@ -238,7 +271,7 @@ function setActiveTab(tab: Workspace) {
   }
   if (tab === 'search' && searchResults.value.length === 0) {
     const topicId = activeTopic.value?.id ?? topics.value[0]?.id;
-    if (topicId != null && (discoverTopicId.value !== topicId || discoverResults.value.length === 0)) {
+    if (topicId != null) {
       loadOpenAlexDiscovery(topicId);
     }
   }
@@ -271,6 +304,7 @@ function editPaper(paper: Paper) {
 
 function saveRadarLimit() {
   radarLimit.value = Math.max(1, Math.min(Number(radarLimitDraft.value) || 3, 10));
+  localStorage.setItem('litradar_radar_limit', String(radarLimit.value));
   radarLimitEditing.value = false;
 }
 
@@ -370,7 +404,26 @@ async function withLoading(actionName: string, action: () => Promise<void>) {
   }
 }
 
+function radarCacheKey(topicId: number): string {
+  return `litradar_radar_${topicId}`;
+}
+
+function loadRadarCache(topicId: number): Recommendation[] | null {
+  try {
+    const raw = localStorage.getItem(radarCacheKey(topicId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed as Recommendation[];
+    return null;
+  } catch { return null; }
+}
+
+function saveRadarCache(topicId: number, recs: Recommendation[]): void {
+  try { localStorage.setItem(radarCacheKey(topicId), JSON.stringify(recs)); } catch { /* quota */ }
+}
+
 async function refreshCollections() {
+  const topicIdNow = selectedTopicId.value ?? topics.value[0]?.id;
   const [topicsPayload, papersPayload, radarPayload] = await Promise.all([
     fetchTopics(),
     fetchPapers(),
@@ -381,9 +434,13 @@ async function refreshCollections() {
   if (!selectedTopicId.value || !topicsPayload.some((topic) => topic.id === selectedTopicId.value)) {
     selectedTopicId.value = topicsPayload[0]?.id ?? null;
   }
-  recommendations.value = selectedTopicId.value
-    ? radarPayload.filter((item) => item.topic.id === selectedTopicId.value)
+  const activeId = selectedTopicId.value;
+  recommendations.value = activeId
+    ? radarPayload.filter((item) => item.topic.id === activeId)
     : radarPayload;
+  if (activeId != null) {
+    saveRadarCache(activeId, recommendations.value);
+  }
   const topic = topicsPayload.find((item) => item.id === selectedTopicId.value) ?? topicsPayload[0];
   if (topic) {
     topicForm.value = {
@@ -398,9 +455,28 @@ async function refreshCollections() {
 
 async function loadAll() {
   await withLoading('load', async () => {
-    health.value = await fetchHealth();
+    // Retry health check silently until backend is ready (Tauri cold start ~15s)
+    for (let i = 0; i < 30; i++) {
+      try {
+        health.value = await fetchHealth();
+        break;
+      } catch {
+        if (i === 0) console.log('Waiting for backend...');
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    if (!health.value) {
+      pushNotification('后端连接失败，请检查服务是否启动。', 'error');
+    }
     const settingsPayload = await fetchLocalSettings();
     settings.value = { ...settings.value, ...settingsPayload, ai_api_key: '' };
+    const cacheId = selectedTopicId.value ?? topics.value[0]?.id;
+    if (cacheId != null) {
+      const cached = loadRadarCache(cacheId);
+      if (cached && cached.length > 0) {
+        recommendations.value = cached;
+      }
+    }
     await refreshCollections();
     if (!settingsPayload.obsidian_vault_path) {
       pushNotification('Obsidian 未配置：当前只生成 Markdown 预览，不写入本地知识库。', 'warning');
@@ -421,6 +497,24 @@ async function submitSettings() {
     settings.value = { ...await saveLocalSettings(payload), ai_api_key: '' };
     pushNotification('本地设置已保存。', 'success');
   });
+}
+
+async function testAi() {
+  testingAi.value = true;
+  aiTestResult.value = null;
+  try {
+    aiTestResult.value = await testAiConnection();
+    if (aiTestResult.value.ok) {
+      pushNotification(`AI 连接成功，模型：${aiTestResult.value.model}`, 'success');
+    } else {
+      pushNotification(aiTestResult.value.error || 'AI 连接失败', 'error');
+    }
+  } catch (caught) {
+    aiTestResult.value = { ok: false, error: caught instanceof Error ? caught.message : '连接异常' };
+    pushNotification('AI 连接测试异常', 'error');
+  } finally {
+    testingAi.value = false;
+  }
 }
 
 async function saveRadarTopic(notify = true) {
@@ -449,34 +543,68 @@ async function submitRadarTopic() {
   });
 }
 
+function onSearchFocus() {
+  if (!searchForm.value.query.trim()) {
+    searchResults.value = [];
+  }
+}
+
 async function submitSearch() {
+  if (!searchForm.value.query.trim()) {
+    searchResults.value = [];
+    return;
+  }
   await withLoading('search', async () => {
     searchResults.value = await searchPapers(searchForm.value.query);
     pushNotification(`找到 ${searchResults.value.length} 篇候选论文。`, 'success');
+    if (searchResults.value.length > 0 && hasApiKey.value) {
+      translatePapersBatch(searchResults.value).then(translated => {
+        if (translated.length === searchResults.value.length) {
+          searchResults.value = translated;
+        }
+      }).catch(() => {});
+    }
   });
 }
 
 async function savePaper(paper: Paper) {
   await withLoading(`save-paper-${paper.arxiv_id || paper.title}`, async () => {
     const saved = await createPaper({ ...paper, topic: null, status: 'saved' });
-    await analyzePaperStructure(saved.id as number);
     await refreshCollections();
     selectPaper(saved.id);
     readerMode.value = 'summary';
-    pushNotification('论文已添加到论文库，并已触发 AI 结构化阅读。', 'success');
+    pushNotification('论文已添加到论文库，正在后台进行 AI 翻译与结构化阅读。', 'success');
+    pendingPaperIds.value.add(saved.id as number);
+    runBackgroundAnalysis(saved.id as number);
   });
 }
 
 async function saveRecommendation(item: Recommendation) {
   await withLoading(`save-paper-${item.paper.arxiv_id || item.paper.title}`, async () => {
     const saved = await createPaper({ ...item.paper, topic: item.topic.id, status: 'saved' });
-    await analyzePaperStructure(saved.id as number);
     await refreshCollections();
     selectPaper(saved.id);
     readerMode.value = 'summary';
-    pushNotification('推荐论文已添加到论文库，并已触发 AI 结构化阅读。', 'success');
+    pushNotification('推荐论文已添加到论文库，正在后台进行 AI 翻译与结构化阅读。', 'success');
+    pendingPaperIds.value.add(saved.id as number);
+    runBackgroundAnalysis(saved.id as number);
   });
 }
+
+async function runBackgroundAnalysis(paperId: number) {
+  try {
+    await analyzePaperStructure(paperId);
+    const updated = await fetchPapers();
+    papers.value = updated;
+  } catch { /* background analysis failed, user can retry manually */ }
+  pendingPaperIds.value.delete(paperId);
+}
+
+const isSelectedPaperLoading = computed(() => {
+  const id = selectedPaperId.value;
+  if (id == null) return false;
+  return pendingPaperIds.value.has(id);
+});
 
 async function submitPaperEdit() {
   if (!editingPaperId.value) return;
@@ -542,7 +670,31 @@ async function loadSelectedPaperNote() {
   });
 }
 
-onMounted(loadAll);
+const isTauriEnv = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+function handleExternalClick(event: MouseEvent) {
+  const target = event.target as HTMLElement;
+  const anchor = target.closest('a');
+  if (!anchor) return;
+  const href = anchor.getAttribute('href') || '';
+  if (href.startsWith('http://') || href.startsWith('https://')) {
+    event.preventDefault();
+    openUrl(href);
+  }
+}
+
+onMounted(() => {
+  loadAll();
+  if (isTauriEnv) {
+    document.addEventListener('click', handleExternalClick);
+  }
+});
+
+onUnmounted(() => {
+  if (isTauriEnv) {
+    document.removeEventListener('click', handleExternalClick);
+  }
+});
 </script>
 
 <template>
@@ -561,7 +713,7 @@ onMounted(loadAll);
 
       <nav class="side-nav">
         <button v-for="item in navItems" :key="item.id" :class="{ active: activeTab === item.id }" :title="item.label" @click="setActiveTab(item.id)">
-          <span class="nav-icon" :class="item.icon" aria-hidden="true" />
+          <span class="nav-icon" :class="[item.icon, { spin: item.icon === 'settings' && hasApiKey }]" aria-hidden="true" />
           <span class="nav-copy">
             <span>{{ item.label }}</span>
             <small>{{ item.description }}</small>
@@ -713,15 +865,18 @@ onMounted(loadAll);
 
             <article class="abstract-card content-panel">
               <h2>中文摘要</h2>
-              <p>{{ displayAbstractZh(selectedPaper) }}</p>
+              <p v-if="isSelectedPaperLoading && !selectedPaper.translated_abstract" class="loading-text">
+                <span class="spinner"></span> AI 翻译中...
+              </p>
+              <p v-else>{{ displayAbstractZh(selectedPaper) }}</p>
               <h2>英文摘要</h2>
               <p>{{ selectedPaper.abstract || '暂无英文摘要。' }}</p>
             </article>
           </template>
 
           <article v-if="readerMode === 'pdf'" class="pdf-render-panel content-panel">
-            <div v-if="!selectedPaper.pdf_url" class="empty-state">{{ selectedPaper.local_pdf_path || '暂无 PDF 地址。' }}</div>
-            <iframe v-else :src="selectedPaper.pdf_url" class="pdf-embed-frame" title="PDF 预览" />
+            <div v-if="!selectedPaper.pdf_url && !selectedPaper.local_pdf_path" class="empty-state">暂无 PDF 地址。</div>
+            <iframe v-else :src="pdfViewUrl" class="pdf-embed-frame" title="PDF 预览" />
           </article>
 
           <article v-if="readerMode === 'graph'" class="insight-panel content-panel single-reader">
@@ -749,7 +904,10 @@ onMounted(loadAll);
                 <p v-else>{{ noteText(selectedPaper.insight.idea_hints) }}</p>
               </section>
             </template>
-            <p v-else class=”empty-state”>还没有结构化阅读结果。点击”刷新 AI 摘要”生成知识图谱素材。</p>
+            <p v-else-if="isSelectedPaperLoading" class="loading-text">
+              <span class="spinner"></span> AI 结构化阅读中...
+            </p>
+            <p v-else class="empty-state">还没有结构化阅读结果。点击"刷新 AI 摘要"生成知识图谱素材。</p>
           </article>
 
           <article v-if="readerMode === 'note'" class="paper-note-panel content-panel single-reader">
@@ -771,7 +929,7 @@ onMounted(loadAll);
                 <p v-else>{{ block.text }}</p>
               </template>
             </div>
-            <p v-else class="empty-state">还没有深度论文笔记。点击“生成笔记”后会用 paper-qa 优先阅读 PDF，并同步到 Obsidian。</p>
+            <p v-else class="empty-state">还没有深度论文笔记。点击"生成笔记"后会用 paper-qa 优先阅读 PDF，并同步到 Obsidian。</p>
           </article>
         </section>
 
@@ -779,7 +937,7 @@ onMounted(loadAll);
 
       <section v-if="activeTab === 'search'" class="content-panel search-panel">
         <div class="search-bar">
-          <input v-model="searchForm.query" placeholder="用分号分隔关键词，例如 HSI；classify" />
+          <input v-model="searchForm.query" placeholder="用分号分隔关键词，例如 HSI；classify" @focus="onSearchFocus" />
           <button class="primary" :disabled="isLoading('search')" @click="submitSearch">
             <span v-if="isLoading('search')" class="spinner"></span>{{ isLoading('search') ? '搜索中' : '搜索' }}
           </button>
@@ -795,7 +953,7 @@ onMounted(loadAll);
               <h3><span class="result-index">{{ index + 1 }}.</span> {{ displayTitleZh(paper) }}</h3>
               <div class="result-meta">
                 <span>{{ displayDate(paper) }}</span>
-                <span>{{ paper.source || 'arXiv' }}</span>
+                <span :title="paper.source || 'arXiv'">{{ paper.source || 'arXiv' }}</span>
                 <span v-if="paper.match_score !== undefined" class="score-badge">🔥 {{ paper.match_score }}</span>
               </div>
               <p>{{ displayAbstractZh(paper) }}</p>
@@ -820,7 +978,7 @@ onMounted(loadAll);
               <h3><span class="result-index">{{ index + 1 }}.</span> {{ displayTitleZh(paper) }}</h3>
               <div class="result-meta">
                 <span>{{ displayDate(paper) }}</span>
-                <span>{{ paper.source || 'OpenAlex' }}</span>
+                <span :title="paper.source || 'OpenAlex'">{{ paper.source || 'OpenAlex' }}</span>
                 <span v-if="paper.match_score !== undefined" class="score-badge">🔥 {{ paper.match_score }}</span>
               </div>
               <p>{{ displayAbstractZh(paper) }}</p>
@@ -844,7 +1002,15 @@ onMounted(loadAll);
         <label>文本模型<input v-model="settings.text_model" placeholder="deepseek-v4-pro" /></label>
         <label>视觉模型<input v-model="settings.vision_model" placeholder="deepseek-v4-pro" /></label>
         <label>Obsidian Vault 路径<input v-model="settings.obsidian_vault_path" placeholder="/path/to/vault" /></label>
-        <button class="primary" :disabled="isLoading('settings')" @click="submitSettings">保存设置</button>
+        <div class="button-row">
+          <button class="primary" :disabled="isLoading('settings')" @click="submitSettings">保存设置</button>
+          <button class="secondary" :disabled="testingAi" @click="testAi">
+            <span v-if="testingAi" class="spinner"></span>{{ testingAi ? '测试中' : '测试 AI 连接' }}
+          </button>
+        </div>
+        <div v-if="aiTestResult" class="ai-test-result" :class="{ ok: aiTestResult.ok }">
+          {{ aiTestResult.ok ? '✅ ' + (aiTestResult.model || '连接正常') : '❌ ' + (aiTestResult.error || '连接失败') }}
+        </div>
       </section>
     </section>
   </main>
@@ -1052,17 +1218,21 @@ onMounted(loadAll);
   transform: translate(7px, 8px) rotate(45deg);
 }
 .nav-icon.settings::before {
-  width: 18px;
-  height: 18px;
-  border: 2px solid currentColor;
-  border-radius: 7px;
+  width: 20px;
+  height: 20px;
+  border: 3px dashed currentColor;
+  border-radius: 50%;
+}
+.nav-icon.settings.spin::before {
+  animation: gear-spin 8s linear infinite;
 }
 .nav-icon.settings::after {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
   background: currentColor;
 }
+@keyframes gear-spin { to { transform: rotate(360deg); } }
 
 .workspace {
   min-width: 0;
@@ -1195,6 +1365,20 @@ h1 { margin-bottom: 0; font-size: 26px; line-height: 1.2; }
   justify-self: start;
   width: auto;
   padding: 9px 18px;
+}
+.ai-test-result {
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 14px;
+  color: #a2251d;
+  background: #fff0ed;
+  border: 1px solid #ffc9c2;
+}
+.ai-test-result.ok {
+  color: #11633b;
+  background: #e9f8ef;
+  border-color: #bde8cc;
 }
 .wide-panel, .reader-pane { min-width: 0; }
 .panel-heading, .reader-title {
@@ -1549,10 +1733,10 @@ dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 .search-result-card {
   position: relative;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 16px;
+  grid-template-rows: auto auto 1fr;
+  gap: 10px;
   width: 100%;
-  height: 200px;
+  min-height: 220px;
   overflow: hidden;
   padding: 20px 52px 18px 20px;
   margin-top: 0;
@@ -1566,6 +1750,7 @@ dd { margin: 2px 0 0; overflow-wrap: anywhere; }
   margin: 0;
   font-size: 17px;
   line-height: 1.4;
+  min-height: calc(17px * 1.4 * 2);
 }
 .search-result-card p {
   display: -webkit-box;
@@ -1576,16 +1761,26 @@ dd { margin: 2px 0 0; overflow-wrap: anywhere; }
   color: var(--muted);
   font-size: 15px;
   line-height: 1.55;
+  max-height: calc(15px * 1.55 * 3);
 }
 .result-index { color: #9aa8bd; }
 .result-meta {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px;
   align-items: center;
   color: var(--muted);
   font-weight: 700;
+  overflow: hidden;
 }
+.result-meta > span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.result-meta > span:first-child { flex-shrink: 0; }
+.result-meta > span:nth-child(2) { flex-shrink: 1; min-width: 0; max-width: 160px; }
+.result-meta > span:last-child { flex-shrink: 0; }
 .result-meta span + span::before {
   content: "-";
   margin-right: 8px;
@@ -1606,6 +1801,15 @@ dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 .discovery-title {
   font-weight: 800;
   color: var(--ai-purple-strong);
+}
+.loading-text {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 0;
+  color: var(--muted);
+  font-weight: 700;
 }
 .discovery-hint {
   padding: 40px 0;
@@ -1659,6 +1863,12 @@ textarea { min-height: 96px; }
   align-self: start;
   height: 420px;
   overflow: auto;
+}
+.topic-side-panel button.primary {
+  width: auto;
+  height: 36px;
+  justify-self: start;
+  padding: 0 18px;
 }
 .radar-limit-row {
   display: grid;

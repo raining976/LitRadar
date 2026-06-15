@@ -10,6 +10,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "@vitejs/plugin-vue": "latest",
     "vite": "latest",
     "vue": "latest"
