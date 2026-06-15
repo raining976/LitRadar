@@ -91,7 +91,7 @@ const paperForm = ref({
 });
 
 const searchForm = ref({
-  query: 'remote sensing change detection',
+  query: '',
 });
 
 const selectedPaper = computed(() => papers.value.find((paper) => paper.id === selectedPaperId.value) ?? null);
@@ -147,9 +147,20 @@ async function loadOpenAlexDiscovery(topicId: number, forceRefresh = false) {
 }
 
 async function refreshOpenAlexDiscovery() {
-  if (discoverTopicId.value != null) {
-    await loadOpenAlexDiscovery(discoverTopicId.value, true);
-    pushNotification('OpenAlex 发现已刷新。', 'success');
+  const topicId = discoverTopicId.value ?? activeTopic.value?.id ?? topics.value[0]?.id;
+  if (topicId != null) {
+    discoverLoading.value = true;
+    try {
+      const papers = await fetchOpenAlexDiscovery(topicId);
+      discoverResults.value = papers;
+      discoverTopicId.value = topicId;
+      saveDiscoverCache(topicId, papers);
+      pushNotification('OpenAlex 发现已刷新。', 'success');
+    } catch (caught) {
+      pushNotification(caught instanceof Error ? caught.message : 'OpenAlex 发现加载失败', 'warning');
+    } finally {
+      discoverLoading.value = false;
+    }
   }
 }
 

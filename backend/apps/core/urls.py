@@ -606,11 +606,12 @@ def parse_openalex_work(work, query="", keywords=None):
 
 def fetch_openalex_works(query, per_page=50):
     """Fetch works from the OpenAlex semantic search API."""
+    cutoff_year = date.today().year - 2
     params = urllib.parse.urlencode({
-        "search.semantic": query,
+        "search": query,
         "per_page": str(per_page),
     })
-    url = f"https://api.openalex.org/works?{params}"
+    url = f"https://api.openalex.org/works?{params}&filter=from_publication_date:{cutoff_year}-01-01"
     request = urllib.request.Request(url, headers={"User-Agent": "LitRadar/0.1 local literature tool"})
     context = ssl._create_unverified_context()
     with urllib.request.urlopen(request, timeout=15, context=context) as response:
