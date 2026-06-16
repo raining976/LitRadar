@@ -99,7 +99,30 @@ const paperForm = ref({
 
 const searchForm = ref({
   query: '',
+  engine: 'arxiv' as 'arxiv' | 'openalex',
+  selectedYears: [] as number[],
 });
+const showYearPicker = ref(false);
+const searchYearOptions = Array.from({ length: 4 }, (_, i) => new Date().getFullYear() - i);
+
+function toggleSearchYear(year: number) {
+  const idx = searchForm.value.selectedYears.indexOf(year);
+  if (idx >= 0) {
+    searchForm.value.selectedYears.splice(idx, 1);
+  } else {
+    searchForm.value.selectedYears.push(year);
+  }
+}
+
+function clearSearchYears() {
+  searchForm.value.selectedYears = [];
+}
+
+function searchFromDate(): string {
+  const years = searchForm.value.selectedYears;
+  if (years.length === 0) return '';
+  return `${Math.min(...years)}-01-01`;
+}
 
 const selectedPaper = computed(() => papers.value.find((paper) => paper.id === selectedPaperId.value) ?? null);
 const savedPaperKeys = computed(() => new Set(papers.value.flatMap((paper) => [
@@ -555,7 +578,7 @@ async function submitSearch() {
     return;
   }
   await withLoading('search', async () => {
-    searchResults.value = await searchPapers(searchForm.value.query);
+    searchResults.value = await searchPapers(searchForm.value.query, searchForm.value.engine, searchFromDate() || undefined);
     pushNotification(`找到 ${searchResults.value.length} 篇候选论文。`, 'success');
     if (searchResults.value.length > 0 && hasApiKey.value) {
       translatePapersBatch(searchResults.value).then(translated => {
@@ -683,17 +706,26 @@ function handleExternalClick(event: MouseEvent) {
   }
 }
 
+function handleClickOutside(event: MouseEvent) {
+  const target = event.target as HTMLElement;
+  if (!target.closest('.search-year-wrapper')) {
+    showYearPicker.value = false;
+  }
+}
+
 onMounted(() => {
   loadAll();
   if (isTauriEnv) {
     document.addEventListener('click', handleExternalClick);
   }
+  document.addEventListener('click', handleClickOutside);
 });
 
 onUnmounted(() => {
   if (isTauriEnv) {
     document.removeEventListener('click', handleExternalClick);
   }
+  document.removeEventListener('click', handleClickOutside);
 });
 </script>
 
@@ -937,6 +969,26 @@ onUnmounted(() => {
 
       <section v-if="activeTab === 'search'" class="content-panel search-panel">
         <div class="search-bar">
+          <select v-model="searchForm.engine" class="search-engine-select">
+            <option value="arxiv">arXiv</option>
+            <option value="openalex">OpenAlex</option>
+          </select>
+          <div v-if="searchForm.engine === 'openalex'" class="search-year-wrapper">
+            <button type="button" class="search-year-toggle" @click="showYearPicker = !showYearPicker">
+              年份 {{ searchForm.selectedYears.length ? `(${searchForm.selectedYears.length})` : '' }}
+            </button>
+            <div v-if="showYearPicker" class="search-year-panel">
+              <button
+                v-for="year in searchYearOptions"
+                :key="year"
+                type="button"
+                class="search-year-chip"
+                :class="{ active: searchForm.selectedYears.includes(year) }"
+                @click="toggleSearchYear(year)"
+              >{{ year }}</button>
+              <button type="button" class="search-year-clear" @click="clearSearchYears">清除</button>
+            </div>
+          </div>
           <input v-model="searchForm.query" placeholder="用分号分隔关键词，例如 HSI；classify" @focus="onSearchFocus" />
           <button class="primary" :disabled="isLoading('search')" @click="submitSearch">
             <span v-if="isLoading('search')" class="spinner"></span>{{ isLoading('search') ? '搜索中' : '搜索' }}
@@ -1721,6 +1773,82 @@ dd { margin: 2px 0 0; overflow-wrap: anywhere; }
   justify-content: center;
   margin-bottom: 16px;
 }
+.search-engine-select {
+  width: auto;
+  padding: 11px 28px 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: white;
+  font: inherit;
+  font-weight: 700;
+  font-size: 14px;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M6 8L1 3h10z' fill='%236f6b7b'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.search-year-wrapper { position: relative; flex-shrink: 0; }
+.search-year-toggle {
+  height: 39px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--muted);
+  background: white;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.search-year-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: white;
+  box-shadow: 0 12px 32px rgba(16, 24, 39, 0.14);
+  flex-wrap: wrap;
+}
+.search-year-chip {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: white;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.search-year-chip.active {
+  color: white;
+  background: var(--ai-purple);
+  border-color: var(--ai-purple);
+}
+.search-year-chip:hover:not(.active) {
+  border-color: var(--ai-purple);
+  color: var(--ai-purple);
+}
+.search-year-clear {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+.search-year-clear:hover { color: var(--ink); }
 .search-bar input { max-width: 420px; flex: 1; }
 .search-bar button { flex-shrink: 0; }
 .search-result-grid {

@@ -17,3 +17,5 @@ frontend/src-tauri/binaries
 frontend/src-tauri/capabilities
 frontend/src-tauri/gen
 frontend/src-tauri/.DS_Store
+backend/apps/core/tests
+frontend/src/api/litradar.test.ts

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import time
 import re
 import ssl
 import urllib.error
@@ -448,14 +449,27 @@ def arxiv_api_url(search_query, max_results):
     )
 
 
+_last_arxiv_request = 0.0
+_ARXIV_MIN_INTERVAL = 3.0  # seconds between arXiv API calls (anonymous rate limit)
+
+
+def _arxiv_rate_limit():
+    global _last_arxiv_request
+    now = time.monotonic()
+    wait = _last_arxiv_request + _ARXIV_MIN_INTERVAL - now
+    if wait > 0:
+        time.sleep(wait)
+    _last_arxiv_request = time.monotonic()
+
+
 def search_arxiv_atom(query, categories=None, max_results=10):
     search_query = build_arxiv_search_query(query, categories)
     if search_query == "all:*" and (query or "").strip():
         raise ValueError("arXiv 只支持英文或 arXiv 可解析的检索词，请输入英文关键词。")
     url = arxiv_api_url(search_query, max_results)
     request = urllib.request.Request(url, headers={"User-Agent": "LitRadar/0.1 local literature tool"})
-    # macOS framework Python can miss system CA roots; arXiv redirects HTTP to HTTPS.
     context = ssl._create_unverified_context()
+    _arxiv_rate_limit()
     with urllib.request.urlopen(request, timeout=12, context=context) as response:
         return parse_arxiv_atom(response.read())
 
@@ -592,7 +606,7 @@ def parse_openalex_work(work, query="", keywords=None):
         "doi": (work.get("doi") or "").replace("https://doi.org/", ""),
         "source": source_info.get("display_name") or "OpenAlex",
         "source_url": primary.get("landing_page_url", ""),
-        "pdf_url": primary.get("pdf_url") or "",
+        "pdf_url": primary.get("pdf_url") or work.get("open_access", {}).get("oa_url") or "",
         "published_date": published_date,
         "version": "",
         "openalex_id": openalex_id,
@@ -604,37 +618,68 @@ def parse_openalex_work(work, query="", keywords=None):
     return enriched
 
 
-def fetch_openalex_works(query, per_page=15):
-    """Fetch works from the OpenAlex semantic search API, last 2 years only."""
-    today_str = date.today().isoformat()
-    cutoff = f"{date.today().year - 2}-01-01"
-    params = urllib.parse.urlencode({
+def fetch_openalex_works(query, per_page=15, recent_only=False, from_date=None):
+    """Fetch works from the OpenAlex semantic search API."""
+    params_dict = {
         "search": query,
         "per_page": str(per_page),
-        "filter": f"from_publication_date:{cutoff},to_publication_date:{today_str}",
-    })
+    }
+    today_str = date.today().isoformat()
+    if from_date:
+        cutoff = from_date
+    elif recent_only:
+        cutoff = f"{date.today().year - 2}-01-01"
+    else:
+        cutoff = None
+    if cutoff:
+        params_dict["filter"] = f"from_publication_date:{cutoff},to_publication_date:{today_str}"
+    params = urllib.parse.urlencode(params_dict)
     url = f"https://api.openalex.org/works?{params}"
     request = urllib.request.Request(url, headers={"User-Agent": "LitRadar/0.1 local literature tool"})
     context = ssl._create_unverified_context()
     with urllib.request.urlopen(request, timeout=15, context=context) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    return payload.get("results", [])
+    results = payload.get("results", [])
+    # Filter out closed-access papers
+    results = [w for w in results if w.get("open_access", {}).get("is_oa")]
+    return results
 
 
 @csrf_exempt
 def papers_search_view(request):
     query = request.GET.get("query", "")
+    engine = request.GET.get("engine", "arxiv")
     topic_id = request.GET.get("topic_id")
     topic_keywords = []
     if topic_id:
         topic = get_object_or_404(ResearchTopic, pk=topic_id)
         topic_keywords = [*topic.keywords, *topic.arxiv_categories]
+
+    if engine == "openalex":
+        from_date = request.GET.get("from_date", "") or None
+        if from_date and len(from_date) == 7:  # YYYY-MM -> YYYY-MM-DD
+            from_date = f"{from_date}-01"
+        try:
+            works = fetch_openalex_works(query, per_page=10, recent_only=not from_date, from_date=from_date)
+        except urllib.error.HTTPError as error:
+            logger.exception("OpenAlex API HTTP error: %s", error.code)
+            return JsonResponse({"error": f"OpenAlex API 返回 {error.code}，请稍后再试。"}, status=503)
+        except (urllib.error.URLError, TimeoutError) as error:
+            logger.exception("OpenAlex API request failed: %s", type(error).__name__)
+            return JsonResponse({"error": "OpenAlex 暂时不可用，请稍后再试。"}, status=503)
+        if not works:
+            return JsonResponse([], safe=False)
+        results = [parse_openalex_work(w, query, topic_keywords) for w in works]
+        return JsonResponse(results, safe=False)
+
     try:
         results = search_arxiv(query, categories=[])
     except ValueError as error:
         return JsonResponse({"error": str(error)}, status=400)
     except urllib.error.HTTPError as error:
         log_arxiv_error(error, query, categories=[], max_results=10)
+        if error.code == 429:
+            return JsonResponse({"error": "arXiv 请求过于频繁，请等待 30 秒后再试。"}, status=503)
         return JsonResponse({"error": f"arXiv API 返回 {error.code}，请稍后再试或调整关键词。"}, status=503)
     except (urllib.error.URLError, TimeoutError) as error:
         log_arxiv_error(error, query, categories=[], max_results=10)
@@ -1401,7 +1446,7 @@ def papers_openalex_discover_view(request):
         return JsonResponse({"error": "当前研究方向未配置关键词，请先在今日雷达中添加英文关键词。"}, status=400)
     query = " ".join(keywords)
     try:
-        works = fetch_openalex_works(query, per_page=15)
+        works = fetch_openalex_works(query, per_page=15, recent_only=True)
     except urllib.error.HTTPError as error:
         logger.exception("OpenAlex API HTTP error: %s", error.code)
         return JsonResponse({"error": f"OpenAlex API 返回 {error.code}，请稍后再试。"}, status=503)
@@ -1447,20 +1492,21 @@ def test_ai_connection_view(request):
 
 @csrf_exempt
 def paper_pdf_proxy_view(_request, paper_id):
-    """Proxy PDF content from source URL, caching locally."""
+    """Proxy PDF content from source URL, streaming without caching."""
     paper = get_object_or_404(Paper, pk=paper_id)
-    pdf_path = local_pdf_for_note(paper)
-    if not pdf_path:
-        return JsonResponse({"error": "无法获取 PDF，请确认 PDF 地址有效。"}, status=404)
+    pdf_url = paper.pdf_url
+    if not pdf_url:
+        return JsonResponse({"error": "暂无 PDF 地址。"}, status=404)
     try:
-        with open(pdf_path, "rb") as f:
-            content = f.read()
-    except OSError:
-        return JsonResponse({"error": "PDF 文件读取失败。"}, status=500)
-    from django.http import HttpResponse
-    response = HttpResponse(content, content_type="application/pdf")
+        req = urllib.request.Request(pdf_url, headers={"User-Agent": "LitRadar/0.1 local literature tool"})
+        context = ssl._create_unverified_context()
+        remote = urllib.request.urlopen(req, timeout=30, context=context)
+    except Exception as e:
+        logger.exception("PDF proxy fetch failed: %s", type(e).__name__)
+        return JsonResponse({"error": "PDF 加载失败，请稍后重试。"}, status=503)
+    from django.http import StreamingHttpResponse
+    response = StreamingHttpResponse(remote, content_type="application/pdf")
     response["Content-Disposition"] = "inline"
-    response["Content-Length"] = str(len(content))
     return response
 
 

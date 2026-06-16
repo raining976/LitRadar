@@ -137,11 +137,10 @@ export function deleteTopic(id: number, fetcher?: Fetcher, baseUrl?: string): Pr
   return requestJson(`/api/topics/${id}/`, fetcher, baseUrl, { method: 'DELETE' });
 }
 
-export function searchPapers(query: string, topicId?: number | null, fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {
-  const params = new URLSearchParams({ query });
-  if (topicId) {
-    params.set('topic_id', String(topicId));
-  }
+export function searchPapers(query: string, engine: string = 'arxiv', fromDate?: string, topicId?: number | null, fetcher?: Fetcher, baseUrl?: string): Promise<Paper[]> {
+  const params = new URLSearchParams({ query, engine });
+  if (fromDate) params.set('from_date', fromDate);
+  if (topicId) params.set('topic_id', String(topicId));
   return requestJson(`/api/papers/search/?${params.toString()}`, fetcher, baseUrl);
 }
 
